@@ -1,14 +1,15 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
-from __future__ import print_function
-
+import enum
 import re
+import struct
 import sys
 from math import sqrt, degrees
 import serial
 from serial.tools.list_ports import comports
 from common import pack, unpack, multiord
 from bluetooth import BT
+
 import rospy
 from tf.transformations import euler_from_quaternion
 from std_msgs.msg import String, Header, UInt8
@@ -32,6 +33,7 @@ class MyoRaw(object):
         self.imu_handlers = []
         self.arm_handlers = []
         self.pose_handlers = []
+        self.battery_handlers = []
 
     def detect_tty(self):
         for p in comports():
@@ -114,8 +116,10 @@ class MyoRaw(object):
             self.write_attr(0x1d, b'\x01\x00')
             # enable on/off arm notifications
             self.write_attr(0x24, b'\x02\x00')
-
+            # enable EMG notifications
             self.start_raw()
+            # enable battery notifications
+            self.write_attr(0x12, b'\x01\x10')
 
         # add data handlers
         def handle_data(p):
@@ -126,6 +130,7 @@ class MyoRaw(object):
             pay = p.payload[5:]
 
             if attr == 0x27:
+                # Unpack a 17 byte array, first 16 are 8 unsigned shorts, last one an unsigned char
                 vals = unpack('8HB', pay)
                 # not entirely sure what the last byte is,
                 # but it's a bitmask that seems to indicate which
@@ -133,12 +138,25 @@ class MyoRaw(object):
                 emg = vals[:8]
                 moving = vals[8]
                 self.on_emg(emg, moving)
+            # Read notification handles corresponding to the for EMG characteristics
+            elif attr == 0x2b or attr == 0x2e or attr == 0x31 or attr == 0x34:
+                '''According to http://developerblog.myo.com/myocraft-emg-in-the-bluetooth-protocol/
+                each characteristic sends two secuential readings in each update,
+                so the received payload is split in two samples. According to the
+                Myo BLE specification, the data type of the EMG samples is int8_t.
+                '''
+                emg1 = struct.unpack('<8b', pay[:8])
+                emg2 = struct.unpack('<8b', pay[8:])
+                self.on_emg(emg1, 0)
+                self.on_emg(emg2, 0)
+            # Read IMU characteristic handle
             elif attr == 0x1c:
                 vals = unpack('10h', pay)
                 quat = vals[:4]
                 acc = vals[4:7]
                 gyro = vals[7:10]
                 self.on_imu(quat, acc, gyro)
+            # Read classifier characteristic handle
             elif attr == 0x23:
                 if len(pay) == 6:
                     try:
@@ -163,6 +181,9 @@ class MyoRaw(object):
                     else:
                         pose = MyoPose(val + 1)
                     self.on_pose(pose)
+            elif attr == 0x11:
+            	battery_level = ord(pay)
+            	self.on_battery(battery_level)
             else:
                 print('data with unknown attr: %02X %s' % (attr, p))
 
@@ -181,31 +202,72 @@ class MyoRaw(object):
         if self.conn is not None:
             self.bt.disconnect(self.conn)
 
+    def sleep_mode(self, mode):
+        self.write_attr(0x19, pack('3B', 9, 1, mode))
+
+    def power_off(self):
+        self.write_attr(0x19, b'\x04\x00')
+
     def start_raw(self):
+
+        ''' To get raw EMG signals, we subscribe to the four EMG notification
+        characteristics by writing a 0x0100 command to the corresponding handles.
+        '''
+        self.write_attr(0x2c, b'\x01\x00')  # Suscribe to EmgData0Characteristic
+        self.write_attr(0x2f, b'\x01\x00')  # Suscribe to EmgData1Characteristic
+        self.write_attr(0x32, b'\x01\x00')  # Suscribe to EmgData2Characteristic
+        self.write_attr(0x35, b'\x01\x00')  # Suscribe to EmgData3Characteristic
+
+        '''Bytes sent to handle 0x19 (command characteristic) have the following
+        format: [command, payload_size, EMG mode, IMU mode, classifier mode]
+        According to the Myo BLE specification, the commands are:
+            0x01 -> set EMG and IMU
+            0x03 -> 3 bytes of payload
+            0x02 -> send 50Hz filtered signals
+            0x01 -> send IMU data streams
+            0x01 -> send classifier events
+        '''
+        self.write_attr(0x19, b'\x01\x03\x02\x01\x01')
+
         '''Sending this sequence for v1.0 firmware seems to enable both raw data and
         pose notifications.
         '''
 
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
+        '''By writting a 0x0100 command to handle 0x28, some kind of "hidden" EMG
+        notification characteristic is activated. This characteristic is not
+        listed on the Myo services of the offical BLE specification from Thalmic
+        Labs. Also, in the second line where we tell the Myo to enable EMG and
+        IMU data streams and classifier events, the 0x01 command wich corresponds
+        to the EMG mode is not listed on the myohw_emg_mode_t struct of the Myo
+        BLE specification.
+        These two lines, besides enabling the IMU and the classifier, enable the
+        transmission of a stream of low-pass filtered EMG signals from the eight
+        sensor pods of the Myo armband (the "hidden" mode I mentioned above).
+        Instead of getting the raw EMG signals, we get rectified and smoothed
+        signals, a measure of the amplitude of the EMG (which is useful to have
+        a measure of muscle strength, but are not as useful as a truly raw signal).
+        '''
+
+        # self.write_attr(0x28, b'\x01\x00')  # Not needed for raw signals
+        # self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
 
     def mc_start_collection(self):
         '''Myo Connect sends this sequence (or a reordering) when starting data
         collection for v1.0 firmware; this enables raw data but disables arm
         and pose notifications.'''
 
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x24, b'\x02\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x09\x01\x01\x00\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x00\x01\x00')
-        self.write_attr(0x28, b'\x01\x00')
-        self.write_attr(0x1d, b'\x01\x00')
-        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x24, b'\x02\x00')  # Suscribe to classifier indications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x01')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier on
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x09\x01\x01\x00\x00')  # Set sleep mode, payload size = 1, never go to sleep, don't know, don't know
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x00\x01\x00')  # Set EMG and IMU, payload size = 3, EMG off, IMU on, classifier off
+        self.write_attr(0x28, b'\x01\x00')  # Suscribe to EMG notifications
+        self.write_attr(0x1d, b'\x01\x00')  # Suscribe to IMU notifications
+        self.write_attr(0x19, b'\x01\x03\x01\x01\x00')  # Set EMG and IMU, payload size = 3, EMG on, IMU on, classifier off
 
     def mc_end_collection(self):
         '''Myo Connect sends this sequence (or a reordering) when ending data
@@ -230,6 +292,13 @@ class MyoRaw(object):
             # first byte tells it to vibrate; purpose of second byte is unknown
             self.write_attr(0x19, pack('3B', 3, 1, length))
 
+    def set_leds(self, logo, line):
+        self.write_attr(0x19, pack('8B', 6, 6, *(logo + line)))
+
+    # def get_battery_level(self):
+    #     battery_level = self.read_attr(0x11)
+    #     return ord(battery_level.payload[5])
+
     def add_emg_handler(self, h):
         self.emg_handlers.append(h)
 
@@ -241,6 +310,9 @@ class MyoRaw(object):
 
     def add_arm_handler(self, h):
         self.arm_handlers.append(h)
+
+    def add_battery_handler(self, h):
+        self.battery_handlers.append(h)
 
     def on_emg(self, emg, moving):
         for h in self.emg_handlers:
@@ -258,9 +330,9 @@ class MyoRaw(object):
         for h in self.arm_handlers:
             h(myoarm_msg)
 
-
-global vibrate_order
-vibrate_order = 0
+    def on_battery(self, battery_level):
+        for h in self.battery_handlers:
+            h(battery_level)
 
 if __name__ == '__main__':
     # Start by initializing the Myo and attempting to connect.
@@ -287,7 +359,12 @@ if __name__ == '__main__':
     gestPub = rospy.Publisher('~myo_gest', MyoPose, queue_size=1)
     gestStrPub = rospy.Publisher('~myo_gest_str', String, queue_size=1)
     posePub = rospy.Publisher('~pose', PoseStamped, queue_size=1)
+    batteryPub = rospy.Publisher('~bat', UInt8, queue_size=1)
 
+    # Package the BatteryLevel data into a message
+    def proc_battery(battery_level):
+    	batteryPub.publish(battery_level)
+    	
     # Package the EMG data into an EmgArray
     def proc_emg(emg, moving):
         # create an array of ints for emg data
@@ -314,10 +391,10 @@ if __name__ == '__main__':
         h.frame_id = rospy.get_name()[1:]
         # We currently don't know the covariance of the sensors with each other
         cov = [0, 0, 0, 0, 0, 0, 0, 0, 0]
-        quat = Quaternion(quat1[0] / 16384.0,
-                          quat1[1] / 16384.0,
+        quat = Quaternion(quat1[1] / 16384.0,
                           quat1[2] / 16384.0,
-                          quat1[3] / 16384.0)
+                          quat1[3] / 16384.0,
+                          quat1[0] / 16384.0)
         # Normalize the quaternion and accelerometer values
         quatNorm = sqrt(quat.x * quat.x + quat.y *
                         quat.y + quat.z * quat.z + quat.w * quat.w)
@@ -371,6 +448,7 @@ if __name__ == '__main__':
     m.add_imu_handler(proc_imu)
     m.add_arm_handler(proc_arm)
     m.add_pose_handler(proc_pose)
+    m.add_battery_handler(proc_battery)
 
     m.connect()
 

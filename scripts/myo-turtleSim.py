@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 ## Simple myo demo that listens to std_msgs/UInt8 poses published 
 ## to the 'myo_gest' topic
