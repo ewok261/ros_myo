@@ -338,10 +338,11 @@ if __name__ == '__main__':
     # Start by initializing the Myo and attempting to connect.
     # If no Myo is found, we attempt to reconnect every 0.5 seconds
     connected = 0
+    myargv = rospy.myargv(argv=sys.argv)
     print("Initializing...")
     while(connected == 0):
         try:
-            m = MyoRaw(sys.argv[1] if len(sys.argv) >= 2 else None)
+            m = MyoRaw(myargv[1] if len(myargv) >= 2 else None)
             connected = 1
         except (ValueError, KeyboardInterrupt) as e:
             print("Myo Armband not found. Attempting to connect...")
